@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Smart CCTV Stream</title>
+
+  <script src="https://cdn.jsdelivr.net/npm/clappr@0.3.13/dist/clappr.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/level-selector@0.2.0/dist/level-selector.min.js"></script>
+
+  <style>
+    body { margin: 0; background: black; }
+    #player { width: 100%; height: 90vh; }
+
+    #stats {
+      position: fixed;
+      top: 10px; left: 10px;
+      background: rgba(0, 0, 0, 0.78);
+      color: #0f0;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 13px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      z-index: 999999;
+      line-height: 1.35;
+      min-width: 320px;
+      user-select: none;
+      pointer-events: none;
+      white-space: nowrap;
+    }
+    .muted { color: #9f9; opacity: 0.85; }
+    .warn { color: #ff0; }
+    .bad  { color: #f66; }
+    .ok   { color: #0f0; }
+  </style>
+</head>
+
+<body>
+  <div id="player"></div>
+
+  <div id="stats">
+    <div><b>Smart CCTV Debug</b> <span class="muted">(Clappr + HLS)</span></div>
+    <div>Status: <span id="st_status">--</span></div>
+
+    <div class="muted" style="margin-top:6px;">Startup</div>
+    <div>TT Manifest: <span id="st_ttm">--</span>s | TT Segment: <span id="st_tts">--</span>s</div>
+    <div>TTFF (First Frame): <span id="st_ttff">--</span>s</div>
+
+    <div class="muted" style="margin-top:6px;">Playback</div>
+    <div>Res: <span id="st_res">--</span> | Level: <span id="st_level">--</span></div>
+    <div>Buffer Ahead: <span id="st_buf">--</span>s | Seg gap: <span id="st_gap">--</span>s</div>
+    <div>Rebuffers: <span id="st_rebuf">0</span> | Rebuf time: <span id="st_rebuftime">0.0</span>s</div>
+    <div>ReadyState: <span id="st_ready">--</span> | Paused: <span id="st_paused">--</span></div>
+  </div>
+
+  <script>
+    const SOURCE = "/hls/master.m3u8";
+    const pageStart = performance.now();
+
+    // ---------- UI helpers ----------
+    const el = (id) => document.getElementById(id);
+    const stStatus   = el("st_status");
+    const stTTM      = el("st_ttm");
+    const stTTS      = el("st_tts");
+    const stTTFF     = el("st_ttff");
+    const stRes      = el("st_res");
+    const stLevel    = el("st_level");
+    const stBuf      = el("st_buf");
+    const stGap      = el("st_gap");
+    const stRebuf    = el("st_rebuf");
+    const stRebufT   = el("st_rebuftime");
+    const stReady    = el("st_ready");
+    const stPaused   = el("st_paused");
+
+    function setText(node, v) { node.textContent = v; }
+    function setClass(node, kind) {
+      node.classList.remove("warn","bad","ok");
+      if (kind) node.classList.add(kind);
+    }
+    function sec(ms) { return (ms / 1000).toFixed(2); }
+
+    // ---------- Network timing (manifest/segment) ----------
+    let firstManifestAt = null;
+    let firstSegmentAt  = null;
+    let lastSegmentFetchAt = null;
+
+    function noteUrl(url) {
+      const u = String(url || "");
+      if (u.includes(".m3u8") && !firstManifestAt) firstManifestAt = performance.now();
+      if (u.includes(".ts")) {
+        if (!firstSegmentAt) firstSegmentAt = performance.now();
+        lastSegmentFetchAt = performance.now();
+      }
+    }
+
+    // 1) Resource Timing (works most times)
+    try {
+      const po = new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) noteUrl(e.name);
+      });
+      po.observe({ entryTypes: ["resource"] });
+    } catch (_) {}
+
+    // 2) Fallback: patch fetch + XHR (covers cases Resource Timing misses)
+    (function patchNet() {
+      const _fetch = window.fetch;
+      if (_fetch) {
+        window.fetch = function(...args) {
+          try { noteUrl(args[0]); } catch (_) {}
+          return _fetch.apply(this, args);
+        };
+      }
+      const _open = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        try { noteUrl(url); } catch (_) {}
+        return _open.call(this, method, url, ...rest);
+      };
+    })();
+
+    // ---------- First frame + rebuffer ----------
+    let firstFrameAt = null;
+
+    let rebufferCount = 0;
+    let rebufferStart = null;
+    let totalRebufferMs = 0;
+
+    function startRebuffer() {
+      if (rebufferStart == null) rebufferStart = performance.now();
+    }
+    function stopRebuffer() {
+      if (rebufferStart != null) {
+        totalRebufferMs += (performance.now() - rebufferStart);
+        rebufferStart = null;
+      }
+    }
+
+    function findVideo() {
+      // Robust: Clappr always uses <video> for HLS playback
+      return document.querySelector("video");
+    }
+
+    function hookVideo(video) {
+      if (!video) return;
+
+      // Best: first painted frame callback
+      if (typeof video.requestVideoFrameCallback === "function") {
+        video.requestVideoFrameCallback(() => {
+          if (!firstFrameAt) firstFrameAt = performance.now();
+        });
+      }
+
+      // Fallbacks
+      video.addEventListener("playing", () => {
+        if (!firstFrameAt) firstFrameAt = performance.now();
+        stopRebuffer();
+      }, { once: true });
+
+      video.addEventListener("waiting", () => {
+        rebufferCount++;
+        startRebuffer();
+      });
+
+      video.addEventListener("stalled", () => startRebuffer());
+      video.addEventListener("canplay", () => stopRebuffer());
+      video.addEventListener("canplaythrough", () => stopRebuffer());
+    }
+
+    function bufferAhead(video) {
+      try {
+        const ct = video.currentTime;
+        const b = video.buffered;
+        for (let i = 0; i < b.length; i++) {
+          const s = b.start(i), e = b.end(i);
+          if (ct >= s && ct <= e) return Math.max(0, e - ct);
+        }
+      } catch (_) {}
+      return null;
+    }
+
+    // ---------- Clappr Player ----------
+    const player = new Clappr.Player({
+      source: SOURCE,
+      parentId: "#player",
+      autoPlay: true,
+      mute: true,
+      plugins: [LevelSelector],
+      levelSelectorConfig: { title: "Quality" },
+      playback: { preload: true },
+      autoSwitch: true,
+
+      // your stable tuning
+      hlsjsConfig: {
+        liveSyncDurationCount: 5,        // ~10s behind live for 2s segments
+        liveMaxLatencyDurationCount: 9,
+        maxBufferLength: 12,
+        backBufferLength: 0,
+        enableWorker: true,
+        lowLatencyMode: false,
+        fragLoadingTimeOut: 15000,
+        manifestLoadingTimeOut: 15000,
+        fragLoadingMaxRetry: 6,
+        manifestLoadingMaxRetry: 6,
+        levelLoadingMaxRetry: 6
+      }
+    });
+
+    // Hook video once it appears (don’t depend on Clappr internals)
+    let hooked = false;
+    const hookInterval = setInterval(() => {
+      const v = findVideo();
+      if (v && !hooked) {
+        hooked = true;
+        hookVideo(v);
+        clearInterval(hookInterval);
+      }
+    }, 200);
+
+    // ---------- Overlay refresh ----------
+    setInterval(() => {
+      const v = findVideo();
+      const pb = player.getPlayback ? player.getPlayback() : null;
+
+      // startup
+      if (firstManifestAt) setText(stTTM, sec(firstManifestAt - pageStart));
+      if (firstSegmentAt)  setText(stTTS, sec(firstSegmentAt - pageStart));
+      if (firstFrameAt)    setText(stTTFF, sec(firstFrameAt - pageStart));
+
+      // playback stats
+      if (v) {
+        const w = v.videoWidth || 0;
+        const h = v.videoHeight || 0;
+        setText(stRes, (w && h) ? `${w}x${h}` : "--");
+
+        setText(stReady, String(v.readyState));
+        setText(stPaused, String(v.paused));
+
+        const ba = bufferAhead(v);
+        if (ba == null) {
+          setText(stBuf, "--");
+          setClass(stBuf, null);
+        } else {
+          setText(stBuf, ba.toFixed(1));
+          if (ba < 0.5) setClass(stBuf, "bad");
+          else if (ba < 2) setClass(stBuf, "warn");
+          else setClass(stBuf, "ok");
+        }
+      } else {
+        setText(stRes, "--");
+        setText(stReady, "--");
+        setText(stPaused, "--");
+        setText(stBuf, "--");
+        setClass(stBuf, null);
+      }
+
+      // segment gap (time since last .ts fetched)
+      if (lastSegmentFetchAt == null) {
+        setText(stGap, "--");
+        setClass(stGap, null);
+      } else {
+        const gap = (performance.now() - lastSegmentFetchAt) / 1000;
+        setText(stGap, gap.toFixed(1));
+        if (gap > 6) setClass(stGap, "bad");
+        else if (gap > 3) setClass(stGap, "warn");
+        else setClass(stGap, "ok");
+      }
+
+      // level
+      const lvl = (pb && typeof pb.currentLevel !== "undefined") ? pb.currentLevel : "--";
+      setText(stLevel, String(lvl));
+
+      // rebuffers
+      setText(stRebuf, String(rebufferCount));
+      const liveRebufMs = totalRebufferMs + (rebufferStart ? (performance.now() - rebufferStart) : 0);
+      setText(stRebufT, (liveRebufMs / 1000).toFixed(1));
+
+      // status
+      let status = "Healthy";
+      let kind = "ok";
+
+      if (!firstFrameAt) { status = "Starting…"; kind = "warn"; }
+      if (v && v.readyState <= 2) { status = "Rebuffering…"; kind = "warn"; }
+
+      const ba2 = v ? (bufferAhead(v) ?? 999) : 999;
+      const gap2 = lastSegmentFetchAt ? ((performance.now() - lastSegmentFetchAt) / 1000) : 0;
+      if (ba2 < 0.5 || gap2 > 6) { status = "Risk: freeze (low buffer / no segments)"; kind = "bad"; }
+
+      setText(stStatus, status);
+      setClass(stStatus, kind);
+    }, 1000);
+  </script>
+</body>
+</html>

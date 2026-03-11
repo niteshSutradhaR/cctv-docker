@@ -1,0 +1,2 @@
+#!/bin/bash
+ffmpeg -fflags +genpts -rtsp_transport tcp -stimeout 5000000 -i "rtsp://mediamtx:8554/mystream" -preset veryfast -tune zerolatency -g 25 -sc_threshold 0 -keyint_min 25 -map 0:v:0 -s:v:0 854x480 -b:v:0 1200k -map 0:v:0 -s:v:1 426x240 -b:v:1 400k -map 0:a:0 -c:a aac -b:a 96k -f hls -hls_time 4 -hls_list_size 6 -hls_flags delete_segments+independent_segments -master_pl_name master.m3u8 -var_stream_map "v:0,a:0 v:1,a:0" -hls_segment_filename "/hls/stream_%v_%03d.ts" /hls/stream_%v.m3u8

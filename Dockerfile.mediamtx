@@ -1,0 +1,5 @@
+# Dockerfile.mediamtx
+FROM bluenviron/mediamtx:latest
+
+COPY rtsp-server/mediamtx.yml /mediamtx.yml
+COPY rtsp-server/videos/sample.mp4 /videos/sample.mp4
